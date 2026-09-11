@@ -1,0 +1,3 @@
+# Official Spotware SDK. It installs Twisted and protocol message dependencies.
+ctrader-open-api
+psycopg2-binary
