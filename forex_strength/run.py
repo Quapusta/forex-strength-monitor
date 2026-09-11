@@ -13,7 +13,7 @@ LOOKBACKS = (timedelta(hours=1), timedelta(hours=4), timedelta(hours=24))
 
 def main() -> None:
     settings = Settings.from_environment()
-    connection = connect(settings.database_path)
+    connection = connect(settings.database_url)
     try:
         refresh_token = load_refresh_token(connection, "ctrader-demo", settings.refresh_token)
         quotes = CTraderSnapshotCollector(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 
 DEFAULT_PAIRS = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCHF,USDCAD"
@@ -10,6 +9,8 @@ DEFAULT_PAIRS = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCHF,USDCAD"
 
 def load_dotenv(path: str = ".env") -> None:
     """Load a simple local .env file without adding a runtime dependency."""
+    from pathlib import Path
+
     env_path = Path(path)
     if not env_path.exists():
         return
@@ -26,16 +27,21 @@ class Settings:
     client_id: str
     client_secret: str
     refresh_token: str
-    database_path: Path
+    database_url: str
     pair_symbols: tuple[str, ...]
 
     @classmethod
     def from_environment(cls) -> "Settings":
         load_dotenv()
-        required = ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_REFRESH_TOKEN")
+        required = (
+            "CTRADER_CLIENT_ID",
+            "CTRADER_CLIENT_SECRET",
+            "CTRADER_REFRESH_TOKEN",
+            "DATABASE_URL",
+        )
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
-            raise RuntimeError(f"Missing cTrader configuration: {', '.join(missing)}")
+            raise RuntimeError(f"Missing configuration: {', '.join(missing)}")
         pairs = tuple(
             value.strip().upper()
             for value in os.environ.get("FOREX_PAIRS", DEFAULT_PAIRS).split(",")
@@ -47,6 +53,6 @@ class Settings:
             os.environ["CTRADER_CLIENT_ID"].strip(),
             os.environ["CTRADER_CLIENT_SECRET"].strip(),
             os.environ["CTRADER_REFRESH_TOKEN"].strip(),
-            Path(os.environ.get("DATABASE_PATH", "data/forex_strength.sqlite3")),
+            os.environ["DATABASE_URL"].strip(),
             pairs,
         )
