@@ -6,3 +6,7 @@ __pycache__/
 
 venv/
 Postpass.txt
+
+HANDOFF_CONTEXT_UA.md
+HANDOFF_SESSION_*.md
+CTRADER_SETUP.md
