@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import psycopg2
 import streamlit as st
 
@@ -260,6 +261,57 @@ def build_rank_table(
     return table.dropna(how="all")
 
 
+def build_heatmap_figure(rank_table: pd.DataFrame) -> go.Figure:
+    """Render the same data as build_rank_table as a currency x period grid.
+
+    rank_table's index is the currency (already sorted, strongest first) and
+    its columns are the period labels plus a leading "Ранг" column, which is
+    dropped here since it doesn't belong on the color scale.
+    """
+    period_columns = [col for col in rank_table.columns if col != "Ранг"]
+    currencies_order = list(rank_table.index)  # strongest-first, from the caller's sort
+
+    z = rank_table[period_columns].to_numpy(dtype=float)
+    text = [[("" if np.isnan(v) else f"{v:+.2f}%") for v in row] for row in z]
+
+    finite = z[~np.isnan(z)]
+    max_abs = float(np.max(np.abs(finite))) if finite.size else 1.0
+    max_abs = max_abs if max_abs > 0 else 1.0
+
+    # USD is the one currency whose strength is a true average across all 7
+    # pairs; every other row is really just its single USD-cross's move with
+    # a sign flip (see README/handoff notes). Bold the USD tick label so
+    # that asymmetry stays visible at a glance instead of implying all 8
+    # rows are equally independent measurements.
+    y_labels = [f"<b>{c}</b>" if c == "USD" else c for c in currencies_order]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=period_columns,
+            y=y_labels,
+            text=text,
+            texttemplate="%{text}",
+            textfont={"size": 13},
+            colorscale="RdYlGn",
+            zmid=0,
+            zmin=-max_abs,
+            zmax=max_abs,
+            colorbar=dict(title="Сила, %"),
+            hovertemplate="%{y} · %{x}: %{z:+.3f}%<extra></extra>",
+            xgap=2,
+            ygap=2,
+        )
+    )
+    fig.update_layout(
+        xaxis_title="Період",
+        yaxis_title="Валюта",
+        yaxis=dict(autorange="reversed"),  # keep rank order: strongest at top
+        margin=dict(t=20, b=20),
+    )
+    return fig
+
+
 def main() -> None:
     st.set_page_config(page_title="Forex relative strength", layout="wide")
 
@@ -421,7 +473,16 @@ def main() -> None:
     if not rank_periods:
         st.info("Виберіть хоча б один період, щоб побачити таблицю рангу.")
     else:
-        sort_period = st.selectbox("Сортувати за", rank_periods, index=0)
+        sort_col, view_col = st.columns([3, 2])
+        with sort_col:
+            sort_period = st.selectbox("Сортувати за", rank_periods, index=0)
+        with view_col:
+            rank_view = st.radio(
+                "Вигляд",
+                ["Таблиця", "Heatmap"],
+                horizontal=True,
+                key="rank_view",
+            )
 
         max_lookback = max(all_rank_periods[period] for period in rank_periods)
         rank_since = now - max_lookback - timedelta(hours=6)  # buffer for asof lookup
@@ -437,15 +498,30 @@ def main() -> None:
             )
         else:
             rank_table = rank_table.sort_values(sort_period, ascending=False)
-            rank_table.insert(0, "Ранг", range(1, len(rank_table) + 1))
-            percent_columns = [col for col in rank_table.columns if col != "Ранг"]
-            st.dataframe(
-                rank_table.style.format({col: "{:+.3f}%" for col in percent_columns}),
-                use_container_width=True,
-            )
+
+            if rank_view == "Heatmap":
+                st.plotly_chart(build_heatmap_figure(rank_table), use_container_width=True)
+                st.caption(
+                    "Зелене — валюта зміцнюється за цей період, червоне — слабшає; "
+                    "інтенсивність кольору ~ величина руху. Різниця двох клітинок в "
+                    "одному стовпці = synthetic крос-курс цих двох валют (base − quote), "
+                    "той самий розрахунок, що й Opportunity score вище. "
+                    "**USD** виділено жирним не просто так: це єдина валюта, чия сила — "
+                    "справжнє середнє з 7 незалежних пар; сила решти валют — це, по суті, "
+                    "рух лише їхньої єдиної пари з USD (зі знаком), тож інші клітинки "
+                    "статистично «шумніші», навіть якщо колір виглядає так само насичено."
+                )
+            else:
+                display_table = rank_table.copy()
+                display_table.insert(0, "Ранг", range(1, len(display_table) + 1))
+                percent_columns = [col for col in display_table.columns if col != "Ранг"]
+                st.dataframe(
+                    display_table.style.format({col: "{:+.3f}%" for col in percent_columns}),
+                    use_container_width=True,
+                )
         st.caption(
             "Ранг рахується на поточний момент (не за весь обраний період на графіку "
-            "вище) — для кожного вибраного вікна: найсильніша валюта вгорі."
+            "вище) — для кожного вибраного вікна: найсильніша валюта вгорі/першою."
         )
 
     st.subheader(f"Сирі ціни за останні {range_label} (діагностика)")
