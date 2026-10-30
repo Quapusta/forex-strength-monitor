@@ -6,6 +6,18 @@ from dataclasses import dataclass
 
 DEFAULT_PAIRS = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCHF,USDCAD"
 
+# Synthetic cross pairs on the dashboard: (numerator, denominator).
+CROSS_PAIRS = (("GER40", "EU50"), ("NAS100", "SPX500"), ("XAUUSD", "XAGUSD"))
+# Our instrument name -> symbol name on the cTrader demo broker.
+CROSS_SYMBOLS = {
+    "GER40": "GERMANY 40",
+    "EU50": "EUROPE 50",
+    "NAS100": "US TECH 100",
+    "SPX500": "US 500",
+    "XAUUSD": "XAUUSD",
+    "XAGUSD": "XAGUSD",
+}
+
 
 def load_dotenv(path: str = ".env") -> None:
     """Load a simple local .env file without adding a runtime dependency."""

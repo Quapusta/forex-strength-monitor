@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extensions
+import psycopg2.extras
 
-from .market import Quote
+from .market import Bar, Quote
 
 
 SCHEMA = """
@@ -24,6 +25,16 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 );
 ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS access_token TEXT;
 ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS bars_m5 (
+  symbol TEXT NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL,
+  open DOUBLE PRECISION NOT NULL,
+  high DOUBLE PRECISION NOT NULL,
+  low DOUBLE PRECISION NOT NULL,
+  close DOUBLE PRECISION NOT NULL CHECK (close > 0),
+  PRIMARY KEY (symbol, opened_at)
+);
 """
 
 
@@ -50,6 +61,29 @@ def save_quotes(connection: psycopg2.extensions.connection, quotes: list[Quote])
             [(quote.symbol, quote.observed_at, quote.price) for quote in quotes],
         )
     connection.commit()
+
+
+def save_bars(connection: psycopg2.extensions.connection, bars: list[Bar]) -> None:
+    """Insert bars, overwriting any stored bar that was still forming when it was fetched."""
+    with connection.cursor() as cursor:
+        psycopg2.extras.execute_values(
+            cursor,
+            "INSERT INTO bars_m5 (symbol, opened_at, open, high, low, close) VALUES %s "
+            "ON CONFLICT (symbol, opened_at) DO UPDATE SET open = EXCLUDED.open, high = EXCLUDED.high, "
+            "low = EXCLUDED.low, close = EXCLUDED.close",
+            [(bar.symbol, bar.opened_at, bar.open, bar.high, bar.low, bar.close) for bar in bars],
+            page_size=1000,
+        )
+    connection.commit()
+
+
+def latest_bar_times(connection: psycopg2.extensions.connection, symbols: tuple[str, ...]) -> dict[str, datetime]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT symbol, MAX(opened_at) FROM bars_m5 WHERE symbol = ANY(%s) GROUP BY symbol",
+            (list(symbols),),
+        )
+        return {str(symbol): opened_at for symbol, opened_at in cursor.fetchall()}
 
 
 def load_tokens(

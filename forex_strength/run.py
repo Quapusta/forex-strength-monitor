@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from datetime import timedelta, timezone
 
-from .config import Settings
+from .config import CROSS_SYMBOLS, Settings
 from .ctrader import CTraderSnapshotCollector, OAuthTokens
-from .storage import connect, forget_access_token, load_tokens, prices_near, save_quotes, save_tokens
+from .storage import (
+    connect,
+    forget_access_token,
+    latest_bar_times,
+    load_tokens,
+    prices_near,
+    save_bars,
+    save_quotes,
+    save_tokens,
+)
 from .strength import calculate_currency_strength, rank_pairs
 
 
@@ -26,6 +35,8 @@ def main() -> None:
                 connection, TOKEN_PROVIDER, tokens.refresh_token, tokens.access_token, tokens.expires_at
             ),
             lambda: forget_access_token(connection, TOKEN_PROVIDER),
+            instruments=CROSS_SYMBOLS,
+            last_bar_times=latest_bar_times(connection, tuple(CROSS_SYMBOLS)),
         )
         quotes = collector.collect()
         now = max(quote.observed_at for quote in quotes).astimezone(timezone.utc)
@@ -41,6 +52,12 @@ def main() -> None:
             ranking = ", ".join(f"{currency} {score:+.3f}%" for currency, score in sorted(strength.items(), key=lambda item: item[1], reverse=True))
             pair, score = rank_pairs(strength)[0]
             print(f"{lookback}: {ranking}; strongest synthetic pair: {pair} ({score:+.3f}%)")
+        if collector.bars:
+            save_bars(connection, collector.bars)
+            print(f"Stored {len(collector.bars)} M5 bars for {', '.join(sorted({bar.symbol for bar in collector.bars}))}")
+        for problem in collector.bar_errors:
+            # A yellow note, not a failed run: the next run fetches the missed bars again.
+            print(f"::warning title=Cross bars::{problem}")
         if collector.refresh_warning:
             # Quotes are saved, but fail the run so the problem shows up while there is time to fix it.
             print(f"::error title=cTrader refresh token::{collector.refresh_warning}")

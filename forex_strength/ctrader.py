@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -18,14 +18,17 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAErrorRes,
     ProtoOAGetAccountListByAccessTokenReq,
     ProtoOAGetAccountListByAccessTokenRes,
+    ProtoOAGetTrendbarsReq,
+    ProtoOAGetTrendbarsRes,
     ProtoOASpotEvent,
     ProtoOASubscribeSpotsReq,
     ProtoOASymbolsListReq,
     ProtoOASymbolsListRes,
 )
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrendbarPeriod
 from twisted.internet import reactor
 
-from .market import Quote
+from .market import Bar, Quote
 
 
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
@@ -34,6 +37,9 @@ PRICE_SCALE = 100_000.0
 # risky refresh call happens about once a month instead of on every run.
 REFRESH_BEFORE_EXPIRY = timedelta(days=7)
 TOKEN_REJECTION_CODES = frozenset({"CH_ACCESS_TOKEN_INVALID", "OA_AUTH_TOKEN_EXPIRED", "ACCOUNT_NOT_AUTHORIZED"})
+BAR_PERIOD = ProtoOATrendbarPeriod.Value("M5")
+# cTrader caps how far back one trendbar request may reach; three days of M5 bars stays inside it.
+BAR_BACKFILL = timedelta(days=3)
 
 
 @dataclass(frozen=True)
@@ -70,11 +76,26 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
 
 
 def _normalise_symbol(name: str) -> str:
-    return "".join(character for character in name.upper() if character.isalpha())
+    # Keep digits: index names such as "GERMANY 40" and "US 500" depend on them.
+    return "".join(character for character in name.upper() if character.isalnum())
+
+
+def _bar_from_trendbar(symbol: str, trendbar: object) -> Bar:
+    """cTrader sends the low as an integer price and the other prices as deltas from it."""
+    low = trendbar.low
+    return Bar(
+        symbol,
+        datetime.fromtimestamp(trendbar.utcTimestampInMinutes * 60, timezone.utc),
+        (low + trendbar.deltaOpen) / PRICE_SCALE,
+        (low + trendbar.deltaHigh) / PRICE_SCALE,
+        low / PRICE_SCALE,
+        (low + trendbar.deltaClose) / PRICE_SCALE,
+    )
 
 
 class CTraderSnapshotCollector:
-    """Collect one midpoint snapshot from the cTrader Demo Open API endpoint."""
+    """Collect one midpoint snapshot from the cTrader Demo Open API endpoint,
+    plus recent M5 bars for the synthetic-cross instruments."""
 
     def __init__(
         self,
@@ -85,6 +106,8 @@ class CTraderSnapshotCollector:
         on_tokens: Callable[[OAuthTokens], None],
         on_access_token_rejected: Callable[[], None],
         timeout_seconds: int = 25,
+        instruments: Mapping[str, str] | None = None,
+        last_bar_times: Mapping[str, datetime] | None = None,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
@@ -100,6 +123,14 @@ class CTraderSnapshotCollector:
         self.account_id: int | None = None
         self.symbol_by_id: dict[int, str] = {}
         self.quotes: dict[str, Quote] = {}
+        # Bars are optional: their problems go to bar_errors and never cost us the FX quotes.
+        self.instruments = dict(instruments or {})
+        self.last_bar_times = dict(last_bar_times or {})
+        self.bar_symbol_ids: dict[str, int] = {}
+        self.pending_bars: list[str] = []
+        self.bars: list[Bar] = []
+        self.bar_errors: list[str] = []
+        self.bars_done = not self.instruments
         self.error: Exception | None = None
         self.finished = False
         self.client = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
@@ -204,22 +235,77 @@ class CTraderSnapshotCollector:
         print(f"cTrader error response: {description}")
 
     def _subscribe_requested_pairs(self, response: object) -> None:
-        matches: dict[str, int] = {}
+        symbol_ids: dict[str, int] = {}
         for symbol in response.symbol:
-            normalised = _normalise_symbol(symbol.symbolName)
-            for pair in self.pairs:
-                if pair not in matches and normalised == pair:
-                    matches[pair] = int(symbol.symbolId)
-        missing = set(self.pairs) - set(matches)
+            symbol_ids.setdefault(_normalise_symbol(symbol.symbolName), int(symbol.symbolId))
+        missing = set(self.pairs) - set(symbol_ids)
         if missing:
             self._finish(RuntimeError(f"These requested pairs are unavailable on the cTrader Demo account: {', '.join(sorted(missing))}"))
             return
-        self.symbol_by_id = {symbol_id: pair for pair, symbol_id in matches.items()}
+        self.symbol_by_id = {symbol_ids[pair]: pair for pair in self.pairs}
         request = ProtoOASubscribeSpotsReq()
         request.ctidTraderAccountId = self._account_id()
         request.symbolId.extend(self.symbol_by_id)
         request.subscribeToSpotTimestamp = True
         self._send(request)
+        try:
+            self._start_bars(symbol_ids)
+        except Exception as error:
+            self.bar_errors.append(f"could not request bars ({error})")
+            self.pending_bars.clear()
+            self.bars_done = True
+
+    def _start_bars(self, symbol_ids: dict[str, int]) -> None:
+        for name, broker_symbol in self.instruments.items():
+            symbol_id = symbol_ids.get(_normalise_symbol(broker_symbol))
+            if symbol_id is None:
+                self.bar_errors.append(f"{name}: symbol '{broker_symbol}' is unavailable on the cTrader Demo account")
+                continue
+            self.bar_symbol_ids[name] = symbol_id
+            self.pending_bars.append(name)
+        self._request_next_bars()
+
+    def _request_next_bars(self) -> None:
+        # One request at a time keeps us well inside the historical-data rate limit.
+        if self.finished:
+            return
+        if not self.pending_bars:
+            self.bars_done = True
+            self._finish_if_complete()
+            return
+        name = self.pending_bars[0]
+        now = datetime.now(timezone.utc)
+        since = max(self.last_bar_times.get(name, now - BAR_BACKFILL), now - BAR_BACKFILL)
+        request = ProtoOAGetTrendbarsReq()
+        request.ctidTraderAccountId = self._account_id()
+        request.symbolId = self.bar_symbol_ids[name]
+        request.period = BAR_PERIOD
+        # Start at the last stored bar, not after it: that bar may still have been forming.
+        request.fromTimestamp = int(since.timestamp() * 1000)
+        request.toTimestamp = int(now.timestamp() * 1000)
+        deferred = self.client.send(request)
+        deferred.addCallbacks(self._bars_answered, self._bars_failed, callbackArgs=(name,), errbackArgs=(name,))
+
+    def _bars_answered(self, message: object, name: str) -> None:
+        try:
+            if message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
+                response = Protobuf.extract(message)
+                self.bars.extend(_bar_from_trendbar(name, trendbar) for trendbar in response.trendbar)
+            else:
+                error = Protobuf.extract(message)
+                self.bar_errors.append(f"{name}: {getattr(error, 'errorCode', 'unexpected response')} {getattr(error, 'description', '')}".strip())
+        except Exception as error:
+            self.bar_errors.append(f"{name}: could not read bars ({error})")
+        self._next_bars(name)
+
+    def _bars_failed(self, failure: object, name: str) -> None:
+        self.bar_errors.append(f"{name}: no bars response ({failure.getErrorMessage()})")
+        self._next_bars(name)
+
+    def _next_bars(self, name: str) -> None:
+        if self.pending_bars and self.pending_bars[0] == name:
+            self.pending_bars.pop(0)
+        self._request_next_bars()
 
     def _record_spot(self, event: object) -> None:
         pair = self.symbol_by_id.get(int(event.symbolId))
@@ -227,7 +313,10 @@ class CTraderSnapshotCollector:
             return
         midpoint = (event.bid + event.ask) / (2 * PRICE_SCALE)
         self.quotes[pair] = Quote(pair, midpoint, datetime.now(timezone.utc))
-        if len(self.quotes) == len(self.pairs):
+        self._finish_if_complete()
+
+    def _finish_if_complete(self) -> None:
+        if len(self.quotes) == len(self.pairs) and self.bars_done:
             self._finish()
 
     def _account_id(self) -> int:
@@ -236,8 +325,14 @@ class CTraderSnapshotCollector:
         return self.account_id
 
     def _timeout(self) -> None:
-        if not self.finished:
-            self._finish(RuntimeError(f"Timed out after {self.timeout_seconds} seconds waiting for cTrader quotes."))
+        if self.finished:
+            return
+        if len(self.quotes) == len(self.pairs):
+            # Every FX quote arrived and only bars are late: keep the quotes.
+            self.bar_errors.append(f"timed out waiting for bars: {', '.join(self.pending_bars) or 'symbol list'}")
+            self._finish()
+            return
+        self._finish(RuntimeError(f"Timed out after {self.timeout_seconds} seconds waiting for cTrader quotes."))
 
     def _finish(self, error: Exception | None = None) -> None:
         if self.finished:

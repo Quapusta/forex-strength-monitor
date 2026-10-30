@@ -6,7 +6,7 @@ Run locally (from the project root, same folder as forex_strength/ and .env):
 
 This reads the same DATABASE_URL used by the collector. It never writes to
 the database and has no dependency on cTrader credentials or trading logic —
-it only queries the `quotes` table that the collector already fills.
+it only queries the `quotes` and `bars_m5` tables that the collector fills.
 
 Requires Streamlit >= 1.30 (for `st.query_params`, used to persist the
 currency filter across a full page reload).
@@ -23,9 +23,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
+import psycopg2.errors
 import streamlit as st
 
-from forex_strength.config import load_dotenv
+from forex_strength.config import CROSS_PAIRS, load_dotenv
 
 PAIRS = ("EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD")
 CURRENCIES = ("USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD")
@@ -69,6 +70,17 @@ RANK_LOOKBACK_PRESETS = {
     "14 днів": timedelta(days=14),
     "30 днів": timedelta(days=30),
 }
+
+CROSS_PERIOD_PRESETS = {
+    "1 година": timedelta(hours=1),
+    "4 години": timedelta(hours=4),
+    "12 годин": timedelta(hours=12),
+    "24 години": timedelta(hours=24),
+    "3 дні": timedelta(days=3),
+}
+BAR_LENGTH = timedelta(minutes=5)
+# Load a few extra days so a weekend or holiday never leaves the period empty.
+CROSS_HISTORY_BUFFER = timedelta(days=4)
 
 CUSTOM_OPTION = "Свій період…"
 
@@ -312,6 +324,209 @@ def build_heatmap_figure(rank_table: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def render_currency_rank(
+    frame: pd.DataFrame, now: datetime, query_since: datetime, database_url: str
+) -> None:
+    st.subheader("Поточний ранг валют")
+
+    if "custom_rank_periods" not in st.session_state:
+        st.session_state.custom_rank_periods = {}
+
+    with st.expander("➕ Додати свій період для таблиці рангу"):
+        custom_text = st.text_input(
+            "Наприклад: 36h, 2.5d, 10d",
+            key="custom_rank_period_text",
+        )
+        if st.button("Додати період", key="add_custom_rank_period"):
+            parsed = parse_period_text(custom_text)
+            if parsed is None:
+                st.error("Не вдалось розпізнати формат. Приклади: 36h, 2.5d, 10d.")
+            else:
+                label = f"свій: {format_timedelta(parsed)}"
+                st.session_state.custom_rank_periods[label] = parsed
+                st.rerun()
+
+    all_rank_periods = {**RANK_LOOKBACK_PRESETS, **st.session_state.custom_rank_periods}
+
+    rank_periods = st.multiselect(
+        "Періоди для таблиці рангу",
+        list(all_rank_periods.keys()),
+        default=["1 година", "4 години", "24 години", "3 дні"],
+    )
+    if not rank_periods:
+        st.info("Виберіть хоча б один період, щоб побачити таблицю рангу.")
+    else:
+        sort_col, view_col = st.columns([3, 2])
+        with sort_col:
+            sort_period = st.selectbox("Сортувати за", rank_periods, index=0)
+        with view_col:
+            rank_view = st.radio(
+                "Вигляд",
+                ["Heatmap", "Таблиця"],
+                horizontal=True,
+                key="rank_view",
+            )
+
+        max_lookback = max(all_rank_periods[period] for period in rank_periods)
+        rank_since = now - max_lookback - timedelta(hours=6)  # buffer for asof lookup
+        rank_frame = frame if rank_since >= query_since else load_quotes(database_url, rank_since)
+
+        rank_table = build_rank_table(
+            rank_frame, {period: all_rank_periods[period] for period in rank_periods}, now
+        )
+        if rank_table.empty or sort_period not in rank_table.columns:
+            st.warning(
+                "Недостатньо історії для обраних періодів. Спробуйте коротші вікна "
+                "або зачекайте, поки накопичиться більше даних."
+            )
+        else:
+            rank_table = rank_table.sort_values(sort_period, ascending=False)
+
+            if rank_view == "Heatmap":
+                st.plotly_chart(build_heatmap_figure(rank_table), use_container_width=True)
+                st.caption(
+                    "Зелене — валюта зміцнюється за цей період, червоне — слабшає; "
+                    "інтенсивність кольору ~ величина руху. Різниця двох клітинок в "
+                    "одному стовпці = synthetic крос-курс цих двох валют (base − quote), "
+                    "той самий розрахунок, що й Opportunity score нижче. "
+                    "**USD** виділено жирним не просто так: це єдина валюта, чия сила — "
+                    "справжнє середнє з 7 незалежних пар; сила решти валют — це, по суті, "
+                    "рух лише їхньої єдиної пари з USD (зі знаком), тож інші клітинки "
+                    "статистично «шумніші», навіть якщо колір виглядає так само насичено."
+                )
+            else:
+                display_table = rank_table.copy()
+                display_table.insert(0, "Ранг", range(1, len(display_table) + 1))
+                percent_columns = [col for col in display_table.columns if col != "Ранг"]
+                st.dataframe(
+                    display_table.style.format({col: "{:+.3f}%" for col in percent_columns}),
+                    use_container_width=True,
+                )
+        st.caption(
+            "Ранг рахується на поточний момент (не за весь обраний період на графіку "
+            "вище) — для кожного вибраного вікна: найсильніша валюта вгорі/першою."
+        )
+
+
+@st.cache_data(ttl=60)
+def load_bars(database_url: str, since: datetime) -> pd.DataFrame:
+    symbols = sorted({symbol for pair in CROSS_PAIRS for symbol in pair})
+    try:
+        with psycopg2.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT symbol, opened_at, close FROM bars_m5 "
+                    "WHERE symbol = ANY(%s) AND opened_at >= %s "
+                    "ORDER BY opened_at",
+                    (symbols, since),
+                )
+                rows = cursor.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        rows = []  # the collector creates the table on its first run after deployment
+    frame = pd.DataFrame(rows, columns=["symbol", "opened_at", "close"])
+    if not frame.empty:
+        frame["opened_at"] = pd.to_datetime(frame["opened_at"], utc=True)
+    return frame
+
+
+def cross_window(
+    bars: pd.DataFrame, numerator: str, denominator: str, period: timedelta
+) -> pd.DataFrame:
+    """Log change, in percent, of each leg and of their ratio since the start of the period.
+
+    Indexed by the time of each bar's close. The period ends at the latest bar, not at
+    the wall clock, so a closed market still shows its last session. A leg without a
+    bar keeps its previous close for up to an hour, so the legs stay aligned.
+    """
+    closes = bars.pivot_table(index="opened_at", columns="symbol", values="close").sort_index()
+    if numerator not in closes.columns or denominator not in closes.columns:
+        return pd.DataFrame()
+    closes = closes[[numerator, denominator]].ffill(limit=12).dropna()
+    if closes.empty:
+        return pd.DataFrame()
+    closes.index = (closes.index + BAR_LENGTH).rename("closed_at")
+    before_start = closes[closes.index <= closes.index[-1] - period]
+    if before_start.empty:
+        return pd.DataFrame()
+    window = closes[closes.index >= before_start.index[-1]]
+    change = np.log(window / window.iloc[0]) * 100
+    change["strength"] = change[numerator] - change[denominator]
+    return change
+
+
+def render_synthetic_crosses(database_url: str, now: datetime) -> None:
+    st.subheader("Синтетичні пари")
+    period_label, period = elastic_period_selector(
+        "Період",
+        CROSS_PERIOD_PRESETS,
+        key="cross_period",
+        default_label="4 години",
+        default_custom_value=8.0,
+        default_custom_unit="годин",
+    )
+    # Whole hours keep the cache key stable between reruns.
+    since = (now - period - CROSS_HISTORY_BUFFER).replace(minute=0, second=0, microsecond=0)
+    bars = load_bars(database_url, since)
+    if bars.empty:
+        st.info("Свічок індексів і металів ще немає. Колектор додасть їх за найближчий запуск (~15 хв).")
+        return
+
+    windows = {pair: cross_window(bars, *pair, period) for pair in CROSS_PAIRS}
+    for column, (numerator, denominator) in zip(st.columns(len(CROSS_PAIRS)), CROSS_PAIRS):
+        window = windows[(numerator, denominator)]
+        with column:
+            if window.empty:
+                st.metric(f"{numerator} / {denominator}", "—")
+                st.caption("Недостатньо історії для цього періоду.")
+                continue
+            last = window.iloc[-1]
+            numerator_stronger = last["strength"] >= 0
+            stronger, weaker = (numerator, denominator) if numerator_stronger else (denominator, numerator)
+            st.metric(f"{numerator} / {denominator}", f"{last['strength']:+.2f}%")
+            st.markdown(
+                f":{'green' if numerator_stronger else 'red'}[**{stronger}** сильніший за {weaker}]  \n"
+                f"{numerator} {last[numerator]:+.2f}% · {denominator} {last[denominator]:+.2f}%"
+            )
+
+    labels = {f"{numerator} / {denominator}": (numerator, denominator) for numerator, denominator in CROSS_PAIRS}
+    choice = st.selectbox("Пара на графіку", list(labels), key="cross_pair")
+    numerator, denominator = labels[choice]
+    window = windows[(numerator, denominator)]
+    if window.empty:
+        st.warning(f"Недостатньо історії {choice} для періоду «{period_label}».")
+        return
+
+    plot = window["strength"].rename("strength_pct").reset_index()
+    plot["closed_at"] = plot["closed_at"].dt.tz_convert(DISPLAY_TZ)
+    fig = px.line(
+        plot,
+        x="closed_at",
+        y="strength_pct",
+        labels={"closed_at": "Час (Варшава)", "strength_pct": f"{numerator} відносно {denominator}, %"},
+        title=f"{choice}: зміна від початку періоду ({period_label})",
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0, y=1, xanchor="left", yanchor="top",
+        text=f"↑ {numerator} сильніший", showarrow=False, font=dict(color="#2e7d32"),
+    )
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0, y=0, xanchor="left", yanchor="bottom",
+        text=f"↓ {denominator} сильніший", showarrow=False, font=dict(color="#c62828"),
+    )
+    fig.update_traces(hovertemplate="%{y:+.2f}%")
+    fig.update_layout(hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+    last_close = window.index[-1].tz_convert(DISPLAY_TZ)
+    st.caption(
+        f"Лінія — наскільки змінилось відношення {numerator}/{denominator} від початку періоду "
+        f"(лог-%, ≈ %). Росте — {numerator} зміцнюється відносно {denominator}; вище нуля — "
+        f"{numerator} сильніший за весь період. Період закінчується на останній 5-хвилинній "
+        f"свічці: {last_close:%d.%m %H:%M} (Варшава); у вихідні це п'ятниця. "
+        "Ціни — cTrader demo, оновлення приблизно раз на 15 хв."
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Forex relative strength", layout="wide")
 
@@ -322,6 +537,7 @@ def main() -> None:
         st.write("")
         if st.button("🔄 Оновити", use_container_width=True):
             load_quotes.clear()
+            load_bars.clear()
             st.rerun()
 
     load_dotenv()
@@ -412,6 +628,8 @@ def main() -> None:
         fig.update_layout(hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
 
+    render_currency_rank(frame, now, query_since, database_url)
+
     st.subheader("Opportunity score по парі")
     pair_choice = st.selectbox("Валютна пара", PAIRS, key="opportunity_pair")
     base, quote = currency_of(pair_choice)
@@ -444,86 +662,6 @@ def main() -> None:
                 "від'ємне — навпаки. Аналітичний показник, не торговий сигнал."
             )
 
-    st.subheader("Поточний ранг валют")
-
-    if "custom_rank_periods" not in st.session_state:
-        st.session_state.custom_rank_periods = {}
-
-    with st.expander("➕ Додати свій період для таблиці рангу"):
-        custom_text = st.text_input(
-            "Наприклад: 36h, 2.5d, 10d",
-            key="custom_rank_period_text",
-        )
-        if st.button("Додати період", key="add_custom_rank_period"):
-            parsed = parse_period_text(custom_text)
-            if parsed is None:
-                st.error("Не вдалось розпізнати формат. Приклади: 36h, 2.5d, 10d.")
-            else:
-                label = f"свій: {format_timedelta(parsed)}"
-                st.session_state.custom_rank_periods[label] = parsed
-                st.rerun()
-
-    all_rank_periods = {**RANK_LOOKBACK_PRESETS, **st.session_state.custom_rank_periods}
-
-    rank_periods = st.multiselect(
-        "Періоди для таблиці рангу",
-        list(all_rank_periods.keys()),
-        default=["1 година", "4 години", "24 години", "3 дні"],
-    )
-    if not rank_periods:
-        st.info("Виберіть хоча б один період, щоб побачити таблицю рангу.")
-    else:
-        sort_col, view_col = st.columns([3, 2])
-        with sort_col:
-            sort_period = st.selectbox("Сортувати за", rank_periods, index=0)
-        with view_col:
-            rank_view = st.radio(
-                "Вигляд",
-                ["Таблиця", "Heatmap"],
-                horizontal=True,
-                key="rank_view",
-            )
-
-        max_lookback = max(all_rank_periods[period] for period in rank_periods)
-        rank_since = now - max_lookback - timedelta(hours=6)  # buffer for asof lookup
-        rank_frame = frame if rank_since >= query_since else load_quotes(database_url, rank_since)
-
-        rank_table = build_rank_table(
-            rank_frame, {period: all_rank_periods[period] for period in rank_periods}, now
-        )
-        if rank_table.empty or sort_period not in rank_table.columns:
-            st.warning(
-                "Недостатньо історії для обраних періодів. Спробуйте коротші вікна "
-                "або зачекайте, поки накопичиться більше даних."
-            )
-        else:
-            rank_table = rank_table.sort_values(sort_period, ascending=False)
-
-            if rank_view == "Heatmap":
-                st.plotly_chart(build_heatmap_figure(rank_table), use_container_width=True)
-                st.caption(
-                    "Зелене — валюта зміцнюється за цей період, червоне — слабшає; "
-                    "інтенсивність кольору ~ величина руху. Різниця двох клітинок в "
-                    "одному стовпці = synthetic крос-курс цих двох валют (base − quote), "
-                    "той самий розрахунок, що й Opportunity score вище. "
-                    "**USD** виділено жирним не просто так: це єдина валюта, чия сила — "
-                    "справжнє середнє з 7 незалежних пар; сила решти валют — це, по суті, "
-                    "рух лише їхньої єдиної пари з USD (зі знаком), тож інші клітинки "
-                    "статистично «шумніші», навіть якщо колір виглядає так само насичено."
-                )
-            else:
-                display_table = rank_table.copy()
-                display_table.insert(0, "Ранг", range(1, len(display_table) + 1))
-                percent_columns = [col for col in display_table.columns if col != "Ранг"]
-                st.dataframe(
-                    display_table.style.format({col: "{:+.3f}%" for col in percent_columns}),
-                    use_container_width=True,
-                )
-        st.caption(
-            "Ранг рахується на поточний момент (не за весь обраний період на графіку "
-            "вище) — для кожного вибраного вікна: найсильніша валюта вгорі/першою."
-        )
-
     st.subheader(f"Сирі ціни за останні {range_label} (діагностика)")
     st.caption(
         "Якщо min і max співпадають (range_pips = 0) для всіх пар — ціна за "
@@ -534,6 +672,8 @@ def main() -> None:
         price_range.style.format({"min": "{:.5f}", "max": "{:.5f}", "last": "{:.5f}", "range_pips": "{:.5f}"}),
         use_container_width=True,
     )
+
+    render_synthetic_crosses(database_url, now)
 
     st.caption(
         "Аналітичний інструмент. Не є торговою рекомендацією та не виконує "

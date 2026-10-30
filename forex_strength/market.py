@@ -11,3 +11,15 @@ class Quote:
     symbol: str
     price: float
     observed_at: datetime
+
+
+@dataclass(frozen=True)
+class Bar:
+    """A five-minute OHLC bar for an index or metal used in a synthetic cross."""
+
+    symbol: str
+    opened_at: datetime
+    open: float
+    high: float
+    low: float
+    close: float
