@@ -3,26 +3,31 @@ from __future__ import annotations
 from datetime import timedelta, timezone
 
 from .config import Settings
-from .ctrader import CTraderSnapshotCollector
-from .storage import connect, load_refresh_token, prices_near, save_quotes, save_refresh_token
+from .ctrader import CTraderSnapshotCollector, OAuthTokens
+from .storage import connect, forget_access_token, load_tokens, prices_near, save_quotes, save_tokens
 from .strength import calculate_currency_strength, rank_pairs
 
 
 LOOKBACKS = (timedelta(hours=1), timedelta(hours=4), timedelta(hours=24))
+TOKEN_PROVIDER = "ctrader-demo"
 
 
 def main() -> None:
     settings = Settings.from_environment()
     connection = connect(settings.database_url)
     try:
-        refresh_token = load_refresh_token(connection, "ctrader-demo", settings.refresh_token)
-        quotes = CTraderSnapshotCollector(
+        refresh_token, access_token, access_expires_at = load_tokens(connection, TOKEN_PROVIDER, settings.refresh_token)
+        collector = CTraderSnapshotCollector(
             settings.client_id,
             settings.client_secret,
-            refresh_token,
+            OAuthTokens(access_token, refresh_token, access_expires_at),
             settings.pair_symbols,
-            lambda token: save_refresh_token(connection, "ctrader-demo", token),
-        ).collect()
+            lambda tokens: save_tokens(
+                connection, TOKEN_PROVIDER, tokens.refresh_token, tokens.access_token, tokens.expires_at
+            ),
+            lambda: forget_access_token(connection, TOKEN_PROVIDER),
+        )
+        quotes = collector.collect()
         now = max(quote.observed_at for quote in quotes).astimezone(timezone.utc)
         current = {quote.symbol: quote.price for quote in quotes}
         save_quotes(connection, quotes)
@@ -36,6 +41,10 @@ def main() -> None:
             ranking = ", ".join(f"{currency} {score:+.3f}%" for currency, score in sorted(strength.items(), key=lambda item: item[1], reverse=True))
             pair, score = rank_pairs(strength)[0]
             print(f"{lookback}: {ranking}; strongest synthetic pair: {pair} ({score:+.3f}%)")
+        if collector.refresh_warning:
+            # Quotes are saved, but fail the run so the problem shows up while there is time to fix it.
+            print(f"::error title=cTrader refresh token::{collector.refresh_warning}")
+            raise SystemExit(1)
     finally:
         connection.close()
 

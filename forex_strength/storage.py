@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
   refresh_token TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS access_token TEXT;
+ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ;
 """
 
 
@@ -50,19 +52,45 @@ def save_quotes(connection: psycopg2.extensions.connection, quotes: list[Quote])
     connection.commit()
 
 
-def load_refresh_token(connection: psycopg2.extensions.connection, provider: str, fallback: str) -> str:
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT refresh_token FROM oauth_tokens WHERE provider = %s", (provider,))
-        row = cursor.fetchone()
-    return str(row[0]) if row else fallback
-
-
-def save_refresh_token(connection: psycopg2.extensions.connection, provider: str, refresh_token: str) -> None:
+def load_tokens(
+    connection: psycopg2.extensions.connection, provider: str, fallback_refresh_token: str
+) -> tuple[str, str, datetime | None]:
+    """Return (refresh token, access token or "", access token expiry or None)."""
     with connection.cursor() as cursor:
         cursor.execute(
-            "INSERT INTO oauth_tokens (provider, refresh_token, updated_at) VALUES (%s, %s, %s) "
-            "ON CONFLICT (provider) DO UPDATE SET refresh_token = EXCLUDED.refresh_token, updated_at = EXCLUDED.updated_at",
-            (provider, refresh_token, datetime.now(timezone.utc)),
+            "SELECT refresh_token, access_token, access_expires_at FROM oauth_tokens WHERE provider = %s",
+            (provider,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return fallback_refresh_token, "", None
+    return str(row[0]), str(row[1] or ""), row[2]
+
+
+def save_tokens(
+    connection: psycopg2.extensions.connection,
+    provider: str,
+    refresh_token: str,
+    access_token: str,
+    access_expires_at: datetime | None,
+) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO oauth_tokens (provider, refresh_token, access_token, access_expires_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (provider) DO UPDATE SET refresh_token = EXCLUDED.refresh_token, "
+            "access_token = EXCLUDED.access_token, access_expires_at = EXCLUDED.access_expires_at, "
+            "updated_at = EXCLUDED.updated_at",
+            (provider, refresh_token, access_token, access_expires_at, datetime.now(timezone.utc)),
+        )
+    connection.commit()
+
+
+def forget_access_token(connection: psycopg2.extensions.connection, provider: str) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE oauth_tokens SET access_token = NULL, access_expires_at = NULL WHERE provider = %s",
+            (provider,),
         )
     connection.commit()
 

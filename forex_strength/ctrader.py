@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
+from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoErrorRes
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
     ProtoOAAccountAuthRes,
+    ProtoOAAccountsTokenInvalidatedEvent,
     ProtoOAApplicationAuthReq,
     ProtoOAApplicationAuthRes,
+    ProtoOAErrorRes,
     ProtoOAGetAccountListByAccessTokenReq,
     ProtoOAGetAccountListByAccessTokenRes,
     ProtoOASpotEvent,
@@ -27,12 +30,20 @@ from .market import Quote
 
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 PRICE_SCALE = 100_000.0
+# Access tokens live ~30 days. Refresh only when less than this is left, so the
+# risky refresh call happens about once a month instead of on every run.
+REFRESH_BEFORE_EXPIRY = timedelta(days=7)
+TOKEN_REJECTION_CODES = frozenset({"CH_ACCESS_TOKEN_INVALID", "OA_AUTH_TOKEN_EXPIRED", "ACCOUNT_NOT_AUTHORIZED"})
 
 
 @dataclass(frozen=True)
 class OAuthTokens:
     access_token: str
     refresh_token: str
+    expires_at: datetime | None = None
+
+    def valid_at(self, moment: datetime) -> bool:
+        return bool(self.access_token) and self.expires_at is not None and self.expires_at > moment
 
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> OAuthTokens:
@@ -50,8 +61,12 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
     access_token = payload.get("accessToken")
     rotated_refresh_token = payload.get("refreshToken")
     if not access_token or not rotated_refresh_token:
-        raise RuntimeError(f"cTrader token refresh failed: {payload.get('description', payload)}")
-    return OAuthTokens(str(access_token), str(rotated_refresh_token))
+        # Never print the raw payload: it may contain a token, and the logs are public.
+        reason = payload.get("description") or payload.get("errorCode") or "response has no tokens"
+        raise RuntimeError(f"cTrader token refresh failed: {reason}")
+    expires_in = payload.get("expiresIn")
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)) if expires_in else None
+    return OAuthTokens(str(access_token), str(rotated_refresh_token), expires_at)
 
 
 def _normalise_symbol(name: str) -> str:
@@ -65,16 +80,21 @@ class CTraderSnapshotCollector:
         self,
         client_id: str,
         client_secret: str,
-        refresh_token: str,
+        stored_tokens: OAuthTokens,
         pairs: tuple[str, ...],
-        on_refresh_token: Callable[[str], None],
+        on_tokens: Callable[[OAuthTokens], None],
+        on_access_token_rejected: Callable[[], None],
         timeout_seconds: int = 25,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
-        self.refresh_token = refresh_token
-        self.on_refresh_token = on_refresh_token
+        self.stored_tokens = stored_tokens
+        self.on_tokens = on_tokens
+        self.on_access_token_rejected = on_access_token_rejected
         self.access_token = ""
+        self.using_stored_access_token = False
+        self.access_token_rejected = False
+        self.refresh_warning: str | None = None
         self.pairs = pairs
         self.timeout_seconds = timeout_seconds
         self.account_id: int | None = None
@@ -85,23 +105,46 @@ class CTraderSnapshotCollector:
         self.client = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
 
     def collect(self) -> list[Quote]:
-        tokens = refresh_access_token(self.client_id, self.client_secret, self.refresh_token)
-        # cTrader invalidates the old refresh token as soon as it rotates it.
-        # Persist the replacement before making any further API request.
-        self.access_token = tokens.access_token
-        self.on_refresh_token(tokens.refresh_token)
+        self.access_token = self._choose_access_token()
         self.client.setConnectedCallback(self._connected)
         self.client.setDisconnectedCallback(self._disconnected)
         self.client.setMessageReceivedCallback(self._received)
         self.client.startService()
         reactor.callLater(self.timeout_seconds, self._timeout)
         reactor.run()
+        if self.access_token_rejected and self.using_stored_access_token:
+            # Forget it so the next run refreshes instead of retrying a dead token.
+            self.on_access_token_rejected()
         if self.error:
             raise self.error
         missing = set(self.pairs) - set(self.quotes)
         if missing:
             raise RuntimeError(f"cTrader did not return a quote for: {', '.join(sorted(missing))}")
         return [self.quotes[pair] for pair in self.pairs]
+
+    def _choose_access_token(self) -> str:
+        now = datetime.now(timezone.utc)
+        stored = self.stored_tokens
+        if stored.valid_at(now + REFRESH_BEFORE_EXPIRY):
+            self.using_stored_access_token = True
+            return stored.access_token
+        try:
+            tokens = refresh_access_token(self.client_id, self.client_secret, stored.refresh_token)
+        except Exception as error:
+            if not stored.valid_at(now):
+                raise
+            # The stored access token still works: keep collecting, but flag that a new
+            # refresh token is needed before the access token expires.
+            self.using_stored_access_token = True
+            self.refresh_warning = (
+                f"cTrader token refresh failed ({error}). Quotes are still collected with the stored "
+                f"access token until {stored.expires_at:%Y-%m-%d %H:%M} UTC; get a new refresh token before then."
+            )
+            return stored.access_token
+        # cTrader invalidates the old refresh token as soon as it rotates it.
+        # Persist the replacement before making any further API request.
+        self.on_tokens(tokens)
+        return tokens.access_token
 
     def _send(self, request: object) -> None:
         deferred = self.client.send(request)
@@ -145,6 +188,20 @@ class CTraderSnapshotCollector:
             self._subscribe_requested_pairs(Protobuf.extract(message))
         elif payload_type == ProtoOASpotEvent().payloadType:
             self._record_spot(Protobuf.extract(message))
+        elif payload_type in (ProtoOAErrorRes().payloadType, ProtoErrorRes().payloadType):
+            self._handle_error(Protobuf.extract(message))
+        elif payload_type == ProtoOAAccountsTokenInvalidatedEvent().payloadType:
+            self.access_token_rejected = True
+            self._finish(RuntimeError("cTrader invalidated the access token."))
+
+    def _handle_error(self, response: object) -> None:
+        description = f"{response.errorCode}: {response.description}" if response.description else response.errorCode
+        if response.errorCode in TOKEN_REJECTION_CODES:
+            self.access_token_rejected = True
+            self._finish(RuntimeError(f"cTrader rejected the access token: {description}"))
+            return
+        # Other errors used to be ignored; log them and let the quote timeout decide.
+        print(f"cTrader error response: {description}")
 
     def _subscribe_requested_pairs(self, response: object) -> None:
         matches: dict[str, int] = {}
